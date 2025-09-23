@@ -3,10 +3,10 @@
   <arg name="name" default="warty"/>
 
   <!-- Throttle odometry -->
-  <node pkg="topic_tools" type="throttle" name="odom_throttle" args="messages /$(arg name)/odom 13 $(arg name)/odom/throttled" output="screen" />
+  <node pkg="topic_tools" type="throttle" name="odom_throttle" args="messages /$(arg name)/dlio/odom_body 13 $(arg name)/odom/throttled" output="screen" />
 
   <!-- Throttle cmd_vel -->
-  <node pkg="topic_tools" type="throttle" name="cmd_vel_throttle" args="messages /$(arg name)/cmd_vel 13 $(arg name)/cmd_vel/throttled" output="screen" />
+  <node pkg="topic_tools" type="throttle" name="cmd_vel_throttle" args="messages /$(arg name)/jackal_velocity_controller/cmd_vel 13 $(arg name)/cmd_vel/throttled" output="screen" />
 
   <!-- Process odom + cmd_vel -->
   <node pkg="mppi_rollouts" type="odom_cmd_vel_processor_full2D" name="odom_cmd_vel_processor" output="screen">
@@ -18,7 +18,7 @@
   </node>
 
   <!-- Rollouts server -->
-  <node pkg="mppi_rollouts" type="rollouts_server_rls.py" name="rollouts_server" output="screen">
+  <node pkg="mppi_rollouts" type="rollouts_server_maml.py" name="rollouts_server" output="screen">
     <param name="name" value="$(arg name)" />
   </node>
 </launch>

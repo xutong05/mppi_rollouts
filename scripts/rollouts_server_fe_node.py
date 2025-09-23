@@ -11,37 +11,19 @@ import rospy
 import torch
 from torch.utils.data import DataLoader
 
-from mppi_rollouts.msg import OdomCmdVelProcessedFull2D
 from mppi_rollouts.srv import MppiRollouts, MppiRolloutsResponse
 
-from function_encoder.coefficients import recursive_least_squares_update
 from terrain_adaptation_rls.data.load_data import load_scenes, PhoenixDataset
 from terrain_adaptation_rls.models.function_encoder import load_model as load_model_fe
 from terrain_adaptation_rls.models.neural_ode import load_model as load_model_node
 
-
-class GlobalState:
-    def __init__(self, device):
-        self.lock = threading.Lock()
-        self.coefficients = torch.zeros(1, 8, device=device)
-        self.P = torch.eye(8, device=device).unsqueeze(0)
-        self.input_time = time.time()
-        self.input_pose_I = torch.zeros((1,3), device=device)
-        self.input_vel_B = torch.zeros(1,3, device=device)
-        self.cmd = torch.zeros(2, device=device)
-        self.first_cmd_received = False
-
-        self.node_err = []
-        self.fe_err = []
-        self.rls_err = []
-        self.time_array = []
 
 def rosmsg_error_handler(error):
     print("[ERROR]: ", error)
     return ('', error.end)
 
 def make_dataloader(indices, n_example_points=100, n_points=1000):
-    scene_data = load_scenes(indices)
+    scene_data = load_scenes(indices, 'jackal_0770')
     inputs = [scene_data[f"scene{i}"][0] for i in indices]
     targets = [scene_data[f"scene{i}"][1] for i in indices]
     dataset = PhoenixDataset(inputs, targets, n_example_points, n_points)
@@ -121,14 +103,8 @@ def handle_calc_rollouts(req):
             X = list encoder a (req.K, req.T+1. N) array. 
     """
     # print("[DEBUG]: Rollouts requested")
+    # print("T: ", req.T)
     start_time = time.time()
-
-    with gs.lock:
-        # Use the coefficients from the global state.
-        coeffs = gs.coefficients.clone()
-
-        # Use static coefficients computed from offline data.
-        # coeffs = static_coefficients.clone()
 
     # Convert x0 and U into torch tensors. Make sure that the 
     # elements of U are loaded into the tensor correctly (so 
@@ -163,7 +139,12 @@ def handle_calc_rollouts(req):
         # Predict the change in pose (expressed in the body frame) and
         # the velocity of the next body frame. 
         with torch.no_grad():
-            output = fe_model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            if model_name == 'FE':
+                output = fe_model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            elif model_name == 'NODE':
+                output = node_model((input, times))
+            else:
+                print("WRONG MODEL NAME")
 
         # Transform the change in pose from the initial body frame
         # to the inertial frame.  
@@ -199,128 +180,9 @@ def handle_calc_rollouts(req):
     # Flatten the trajectories to a list in ROW major order so
     # that it is easy to unpack into an ArrayFire Array in C++. 
     X_flat = X.permute(0, 2, 1).contiguous().flatten().tolist()
-    print(f"[DEBUG]: Rollouts sent {time.time() - start_time} seconds later.")
+    # print(f"[DEBUG]: Rollouts sent {time.time() - start_time} seconds later.")
+    print(time.time() - start_time)
     return MppiRolloutsResponse(X_flat)  
-
-
-def rls_update(data):
-    # print("[DEBUG]: Received a new command velocity for RLS update")
-
-    # Unpack the data from the message (these are the targets). 
-    target_time = data.time
-    target_xPos = data.xPos
-    target_yPos = data.yPos
-    target_yaw = np.unwrap([gs.input_pose_I.cpu()[:,2].item(), data.yaw])[1]
-    target_xVel = data.xVel
-    target_yVel = data.yVel
-    target_zAngVel = data.zAngVel
-
-    # Maintain a certain framerate.
-    del_t = target_time - gs.input_time
-
-    # Make sure you have two points to process. 
-    if gs.first_cmd_received:
-
-        # Build x_step tensor from the previous states.
-        x_step = torch.cat(
-            (torch.zeros_like(gs.input_vel_B), gs.input_vel_B),  # Previous velocity in body frame
-            dim=-1
-        ).unsqueeze(0)
-
-        # Build the u_step vector from the previous controls.
-        u_step = torch.tensor(
-            [gs.input_cmd_xVel, gs.input_cmd_zAngVel],dtype=torch.float32, device=device
-        ).unsqueeze(0).unsqueeze(0)
-
-        # Build the dt_step tensor from the time difference.
-        dt_step = torch.tensor(
-            [del_t], dtype=torch.float32, device=device
-        ).unsqueeze(0)
-
-        # Set the target pose and velocity tensors.
-        target_pose_I = torch.tensor(
-            [target_xPos, target_yPos, target_yaw], dtype=torch.float32, device=device
-        ).unsqueeze(0)
-
-        # Transform the target positions into the body frame of the previous state.
-        target_del_pose_B = inertial_to_body(
-            gs.input_pose_I,  target_pose_I - gs.input_pose_I
-        )
-
-        # Transform the target velocities into the body frame of the previous state.
-        target_vel_B = body_to_inertial(
-            target_pose_I, 
-            torch.tensor(
-                [target_xVel, target_yVel, target_zAngVel], 
-                dtype=torch.float32, device=device
-            ).unsqueeze(0)   # xBMat
-        )
-        target_vel_B = inertial_to_body(gs.input_pose_I, target_vel_B)
-
-        # Build the y_step tensor (change in pose and vel) from the target.
-        y_step = torch.cat(
-            (target_del_pose_B, target_vel_B - gs.input_vel_B), dim=-1
-        ).unsqueeze(0)
-
-        with torch.no_grad():
-
-            # Compute the basis functions 
-            # [batch_size, n_points, n_features, n_basis]
-            g = fe_model.basis_functions((torch.cat((x_step,u_step), dim=-1), dt_step))
-
-            L = torch.linalg.cholesky(gs.P)
-
-            with gs.lock:
-                gs.coefficients, gs.P = recursive_least_squares_update(
-                    method='qr',
-                    g=g,
-                    y=y_step,
-                    P=L,
-                    coefficients=gs.coefficients,
-                    forgetting_factor=0.95,
-                )
-
-                # Compute the recursive least squares prediction error
-                pred = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=gs.coefficients)
-            
-            # Compute the RLS error. 
-            loss_rls = torch.nn.functional.mse_loss(pred, y_step)
-            gs.rls_err.append(loss_rls.item())
-
-            # Compute the baseline prediction error for a neural ODE. 
-            # pred_node_model = node_model((torch.cat((x_step, u_step), dim=-1), dt_step))
-            # loss_node_model = torch.nn.functional.mse_loss(pred_node_model, y_step)
-            # gs.node_err.append(loss_node_model.item())
-
-            # Compute the baseline prediction error for static real coeffs.
-            # pred_fe_model = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=static_coefficients)
-            # loss_fe_model = torch.nn.functional.mse_loss(pred_fe_model, y_step)
-            # gs.fe_err.append(loss_fe_model.item())
-
-            # Record the target time (time of prediction)
-            gs.time_array.append(target_time)
-
-    # Save the new state and control for the next iteration.
-    gs.input_time = target_time
-    gs.input_pose_I = torch.tensor(
-        [
-            data.xPos, 
-            data.yPos, 
-            np.unwrap([data.yaw])[0]
-        ], 
-        dtype=torch.float32, device=device
-    ).unsqueeze(0)
-    
-    gs.input_vel_B = torch.tensor(
-        [data.xVel, data.yVel, data.zAngVel], 
-        dtype=torch.float32, device=device
-    ).unsqueeze(0)
-    
-    gs.input_cmd_xVel = data.cmd_xVel
-    gs.input_cmd_zAngVel = data.cmd_zAngVel
-
-    # Set the flag to true
-    gs.first_cmd_received = True
 
 
 def make_hardware_dataloader(data_path, n_example_points=100, n_points=1000):
@@ -353,34 +215,26 @@ def load_csv(full_path):
 
 # Choose (1) the FE model, (2) the NODE model, (3) the baseline coeff data
 home = os.path.expanduser('~')
-fe_path = f'{home}/terrain-adaptation-rls/logs/warthog_sim/function_encoder/seed=0/function_encoder_model.pth'
-# node_path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/neural_ode/seed=42/hidden_size=16/neural_ode_model.pth'
-# data_path = f"{home}/terrain-adaptation-rls/logs/jackal_0770/gym-floor-2/function_encoder/seed=42/jackal_0770_gym-floor2"
+model_name = 'NODE'
+n_basis = 8
+hidden_size = 128
+seed = 0
+platform = "warthog_sim"
+fe_path = f'{home}/terrain-adaptation-rls/logs/{platform}/function_encoder/seed={seed}/function_encoder_model.pth'
+node_path = f'{home}/terrain-adaptation-rls/logs/{platform}/neural_ode/seed={seed}/neural_ode_model.pth'
+data_path = f"{home}/terrain-adaptation-rls/terrain_adaptation_rls/data_split/{platform}/seed_{seed}/scene1" 
 
 # Register the 'rosmsg' error handler
 codecs.register_error("rosmsg", rosmsg_error_handler)
 
 # Load the FE and NODE models.
 device = "cuda" if torch.cuda.is_available() else "cpu"
-fe_model = load_model_fe(device = device, path = fe_path) 
-# node_model = load_model_node(device = device, path = node_path, hidden_size=16)
+fe_model = load_model_fe(device = device, path = fe_path, n_basis=n_basis, hidden_size=hidden_size) 
+node_model = load_model_node(device = device, path = node_path, n_basis=n_basis, hidden_size=hidden_size)
 
 # Get coeffs from the historical trajectories.
-# dataloader_real = make_hardware_dataloader(data_path=data_path)
-# static_coefficients, _ = get_coefficients(dataloader_real, fe_model, device)
-
-# Initialize the global object to track information. 
-gs = GlobalState(device) 
-
-
-
-# Create two dataloaders for simulated data
-# dataloader_pave = make_dataloader([0])
-# dataloader_ice = make_dataloader([1])
-
-# Get baseline coefficients for simulated data
-# ice_coefficients, _ = get_coefficients(dataloader_ice, fe_model, device)
-# pave_coefficients, _ = get_coefficients(dataloader_pave, fe_model, device)
+dataloader_real = make_hardware_dataloader(data_path=data_path)
+coeffs, _ = get_coefficients(dataloader_real, fe_model, device)
 
 
 if __name__ == "__main__":
@@ -388,37 +242,13 @@ if __name__ == "__main__":
     rospy.init_node('rollouts_server')
 
     # Get robot name from a private parameter (default: "warty")
-    name = rospy.get_param("~name", "jackal_0770")
+    name = rospy.get_param("~name", "warty")
 
     # Start the rollouts service.
     service = rospy.Service(f'{name}/calc_rollouts', MppiRollouts, handle_calc_rollouts)
     rospy.loginfo("Service 'calc_rollouts' ready to calculate MPPI rollouts.")
 
-    # Initialize a ROS subscriber.
-    rospy.Subscriber(f'{name}/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
-
     try:
         rospy.spin()
     except KeyboardInterrupt:
         rospy.loginfo("Shutting down rollouts server due to keyboard interrupt.")
-    finally:
-
-        # Define CSV filename
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        csv_path = f"{home}/dummy_ws/src/mppi_rollouts/_data/jackal_0770_rls_errors_{timestamp}.csv"
-
-        # Pad shorter lists with NaNs to align lengths
-        max_len = max(len(gs.time_array), len(gs.rls_err))
-        def pad(lst): return lst + [float('nan')] * (max_len - len(lst))
-
-        rows = zip(
-            pad(gs.time_array),
-            pad(gs.rls_err),
-            # pad(gs.node_err),
-            # pad(gs.fe_err),
-        )
-
-        with open(csv_path, mode='w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["time_array", "rls_err"])
-            writer.writerows(rows)

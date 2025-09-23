@@ -14,45 +14,28 @@ from torch.utils.data import DataLoader
 from mppi_rollouts.msg import OdomCmdVelProcessedFull2D
 from mppi_rollouts.srv import MppiRollouts, MppiRolloutsResponse
 
-from function_encoder.coefficients import recursive_least_squares_update
-from terrain_adaptation_rls.data.load_data import load_scenes, PhoenixDataset
-from terrain_adaptation_rls.models.function_encoder import load_model as load_model_fe
-from terrain_adaptation_rls.models.neural_ode import load_model as load_model_node
+from terrain_adaptation_rls.models.maml import load_model as load_model_maml
+from terrain_adaptation_rls.models.maml import loss_fn as maml_loss_fn
+from meta_learning.maml import adapt_model
 
 
 class GlobalState:
-    def __init__(self, device):
+    def __init__(self, model, device):
         self.lock = threading.Lock()
-        self.coefficients = torch.zeros(1, 8, device=device)
-        self.P = torch.eye(8, device=device).unsqueeze(0)
+        self.adapted_model = model
         self.input_time = time.time()
         self.input_pose_I = torch.zeros((1,3), device=device)
         self.input_vel_B = torch.zeros(1,3, device=device)
         self.cmd = torch.zeros(2, device=device)
         self.first_cmd_received = False
 
-        self.node_err = []
-        self.fe_err = []
-        self.rls_err = []
+        self.maml_err = []
         self.time_array = []
+
 
 def rosmsg_error_handler(error):
     print("[ERROR]: ", error)
     return ('', error.end)
-
-def make_dataloader(indices, n_example_points=100, n_points=1000):
-    scene_data = load_scenes(indices)
-    inputs = [scene_data[f"scene{i}"][0] for i in indices]
-    targets = [scene_data[f"scene{i}"][1] for i in indices]
-    dataset = PhoenixDataset(inputs, targets, n_example_points, n_points)
-    return iter(DataLoader(dataset, batch_size=1))
-
-def get_coefficients(dataloader_iter, model, device):
-    _, _, _, example_xs, example_dt, example_ys = next(dataloader_iter)
-    example_xs = example_xs.to(device)
-    example_dt = example_dt.to(device)
-    example_ys = example_ys.to(device)
-    return model.compute_coefficients((example_xs, example_dt), example_ys)
 
 def wrap_to_pi(theta):
     return (theta + torch.pi) % (2 * torch.pi) - torch.pi
@@ -60,6 +43,7 @@ def wrap_to_pi(theta):
 def body_to_inertial(
         bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
         xBMat,    # (K, 3) matrix of vectors in the body frame
+        device
 ):
     """ Transforms body frame vectors into the inertial frame. """
 
@@ -85,6 +69,7 @@ def body_to_inertial(
 def inertial_to_body(
         bIMat,    # (K, 3) matrix of body frame origin vectors in the inertial frame
         xIMat,    # (K, 3) matrix of vectors in the inertial frame
+        device
 ):
     """ Transforms inertial frame vectors into the body frame. """
 
@@ -121,14 +106,11 @@ def handle_calc_rollouts(req):
             X = list encoder a (req.K, req.T+1. N) array. 
     """
     # print("[DEBUG]: Rollouts requested")
+    # print("T: ", req.T)
     start_time = time.time()
 
     with gs.lock:
-        # Use the coefficients from the global state.
-        coeffs = gs.coefficients.clone()
-
-        # Use static coefficients computed from offline data.
-        # coeffs = static_coefficients.clone()
+        adapted_model = gs.adapted_model
 
     # Convert x0 and U into torch tensors. Make sure that the 
     # elements of U are loaded into the tensor correctly (so 
@@ -150,6 +132,8 @@ def handle_calc_rollouts(req):
     # the initial state of each sample along X. 
     x0_reshaped = x0.reshape(req.N, 1, 1) 
     X[:, :, 0] = x0_reshaped.repeat(1, req.K, 1).squeeze(2) 
+
+    # import pdb; pdb.set_trace()
     
     # Integrate over time. 
     for i in range(req.T):
@@ -163,13 +147,17 @@ def handle_calc_rollouts(req):
         # Predict the change in pose (expressed in the body frame) and
         # the velocity of the next body frame. 
         with torch.no_grad():
-            output = fe_model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            # output = fe_model((input, times), coefficients=coeffs) # xs = [bs, num_pts, 8], dt = [bs, num_pts]
+            
+            # adapted_model.to("cpu")
+            output = adapted_model((input, times)) 
 
         # Transform the change in pose from the initial body frame
         # to the inertial frame.  
         del_states_I = body_to_inertial(
             X[:3,:,i].transpose(1,0), 
-            output.squeeze(0)[:,:3]
+            output.squeeze(0)[:,:3],
+            device
         )
         
         # Translate the change in pose in the inertial frame
@@ -183,11 +171,13 @@ def handle_calc_rollouts(req):
         # Rotate the next velocity from Bi to I and then to Bf.
         next_vel_I = body_to_inertial(
             X[:3,:,i].transpose(1,0),  # orientation at t of Bi relative to I
-            next_vel_Bi # velocity of Bf relative to I expressed in Bi 
+            next_vel_Bi, # velocity of Bf relative to I expressed in Bi 
+            device
         )
         next_vel_Bf = inertial_to_body(
             X[:3,:,i+1].transpose(1,0),  # orientation at t+1 of Bf relative to I
             next_vel_I,    # (K, 3) matrix of vectors in the inertial frame
+            device
         )
 
         # Update the velocity of the next frame (expressed in next frame).
@@ -199,12 +189,14 @@ def handle_calc_rollouts(req):
     # Flatten the trajectories to a list in ROW major order so
     # that it is easy to unpack into an ArrayFire Array in C++. 
     X_flat = X.permute(0, 2, 1).contiguous().flatten().tolist()
-    print(f"[DEBUG]: Rollouts sent {time.time() - start_time} seconds later.")
+    # print(f"[DEBUG]: Rollouts sent {time.time() - start_time} seconds later.")
+    print("Rollout time: ", time.time() - start_time)
     return MppiRolloutsResponse(X_flat)  
 
 
-def rls_update(data):
-    # print("[DEBUG]: Received a new command velocity for RLS update")
+def maml_update(data):
+    print("[DEBUG]: Received a new command velocity for RLS update")
+    start_time = time.time()
 
     # Unpack the data from the message (these are the targets). 
     target_time = data.time
@@ -217,6 +209,9 @@ def rls_update(data):
 
     # Maintain a certain framerate.
     del_t = target_time - gs.input_time
+
+    # Set the device to cuda when updating MAML.
+    # device = "cuda"
 
     # Make sure you have two points to process. 
     if gs.first_cmd_received:
@@ -244,7 +239,7 @@ def rls_update(data):
 
         # Transform the target positions into the body frame of the previous state.
         target_del_pose_B = inertial_to_body(
-            gs.input_pose_I,  target_pose_I - gs.input_pose_I
+            gs.input_pose_I,  target_pose_I - gs.input_pose_I, device
         )
 
         # Transform the target velocities into the body frame of the previous state.
@@ -253,52 +248,43 @@ def rls_update(data):
             torch.tensor(
                 [target_xVel, target_yVel, target_zAngVel], 
                 dtype=torch.float32, device=device
-            ).unsqueeze(0)   # xBMat
+            ).unsqueeze(0),   # xBMat
+            device
         )
-        target_vel_B = inertial_to_body(gs.input_pose_I, target_vel_B)
+        target_vel_B = inertial_to_body(gs.input_pose_I, target_vel_B, device)
 
         # Build the y_step tensor (change in pose and vel) from the target.
         y_step = torch.cat(
             (target_del_pose_B, target_vel_B - gs.input_vel_B), dim=-1
         ).unsqueeze(0)
 
+        # Adapt the MAML model to the scene.
+        example_data = (torch.cat((x_step, u_step), dim=-1), dt_step, y_step)
+        with gs.lock:
+            # import pdb; pdb.set_trace()
+            gs.adapted_model = adapt_model(
+                model=gs.adapted_model, #.to(device),
+                example_data=example_data,
+                loss_fn=maml_loss_fn,
+                inner_lr=inner_lr,
+                inner_steps=inner_steps,
+                device=device,
+            )
+
         with torch.no_grad():
-
-            # Compute the basis functions 
-            # [batch_size, n_points, n_features, n_basis]
-            g = fe_model.basis_functions((torch.cat((x_step,u_step), dim=-1), dt_step))
-
-            L = torch.linalg.cholesky(gs.P)
-
-            with gs.lock:
-                gs.coefficients, gs.P = recursive_least_squares_update(
-                    method='qr',
-                    g=g,
-                    y=y_step,
-                    P=L,
-                    coefficients=gs.coefficients,
-                    forgetting_factor=0.95,
-                )
-
-                # Compute the recursive least squares prediction error
-                pred = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=gs.coefficients)
+            # Compute the recursive least squares prediction error
+            pred = gs.adapted_model((torch.cat((x_step, u_step), dim=-1), dt_step))
             
             # Compute the RLS error. 
-            loss_rls = torch.nn.functional.mse_loss(pred, y_step)
-            gs.rls_err.append(loss_rls.item())
-
-            # Compute the baseline prediction error for a neural ODE. 
-            # pred_node_model = node_model((torch.cat((x_step, u_step), dim=-1), dt_step))
-            # loss_node_model = torch.nn.functional.mse_loss(pred_node_model, y_step)
-            # gs.node_err.append(loss_node_model.item())
-
-            # Compute the baseline prediction error for static real coeffs.
-            # pred_fe_model = fe_model((torch.cat((x_step, u_step), dim=-1), dt_step), coefficients=static_coefficients)
-            # loss_fe_model = torch.nn.functional.mse_loss(pred_fe_model, y_step)
-            # gs.fe_err.append(loss_fe_model.item())
+            loss_maml = torch.nn.functional.mse_loss(pred, y_step)
+            gs.maml_err.append(loss_maml.item())
 
             # Record the target time (time of prediction)
             gs.time_array.append(target_time)
+        
+        # move model back to CPU for fast rollouts
+        # with gs.lock:
+        #     gs.adapted_model = gs.adapted_model.to("cpu")
 
     # Save the new state and control for the next iteration.
     gs.input_time = target_time
@@ -322,65 +308,31 @@ def rls_update(data):
     # Set the flag to true
     gs.first_cmd_received = True
 
+    # print("Update time: ", time.time() - start_time)
 
-def make_hardware_dataloader(data_path, n_example_points=100, n_points=1000):
 
-    # Load data as CSV
-    test_inputs_np = load_csv(f"{data_path}/test_input.csv")
-    test_targets_np = load_csv(f"{data_path}/test_target.csv")
 
-    # Convert to torch tensor
-    test_inputs = [torch.from_numpy(test_inputs_np).float()]
-    test_targets = [torch.from_numpy(test_targets_np).float()]
-
-    # Build the dataloader.
-    dataset = PhoenixDataset(test_inputs, test_targets, n_example_points, n_points)
-    return iter(DataLoader(dataset, batch_size=1))
-
-def load_csv(full_path):
-    data = []
-    with open(full_path, "r") as f:
-        reader = csv.reader(f)
-        next(reader)  # Skip the header row
-        for row in reader:
-            data.append([float(x) for x in row])
-    return np.array(data)
 
 
 
 
 # =========================== SETUP ======================================
 
-# Choose (1) the FE model, (2) the NODE model, (3) the baseline coeff data
-home = os.path.expanduser('~')
-fe_path = f'{home}/terrain-adaptation-rls/logs/warthog_sim/function_encoder/seed=0/function_encoder_model.pth'
-# node_path = f'{home}/terrain-adaptation-rls/logs/jackal_0770/grass_gym_ice23-15/neural_ode/seed=42/hidden_size=16/neural_ode_model.pth'
-# data_path = f"{home}/terrain-adaptation-rls/logs/jackal_0770/gym-floor-2/function_encoder/seed=42/jackal_0770_gym-floor2"
-
 # Register the 'rosmsg' error handler
 codecs.register_error("rosmsg", rosmsg_error_handler)
 
-# Load the FE and NODE models.
+# Meta-learning hyperparameters
+inner_lr = 1e-2
+inner_steps = 5
+
+# Load the MAML model.
+home = os.path.expanduser('~')
+n_basis = 8
+hidden_size = 128
 device = "cuda" if torch.cuda.is_available() else "cpu"
-fe_model = load_model_fe(device = device, path = fe_path) 
-# node_model = load_model_node(device = device, path = node_path, hidden_size=16)
-
-# Get coeffs from the historical trajectories.
-# dataloader_real = make_hardware_dataloader(data_path=data_path)
-# static_coefficients, _ = get_coefficients(dataloader_real, fe_model, device)
-
-# Initialize the global object to track information. 
-gs = GlobalState(device) 
-
-
-
-# Create two dataloaders for simulated data
-# dataloader_pave = make_dataloader([0])
-# dataloader_ice = make_dataloader([1])
-
-# Get baseline coefficients for simulated data
-# ice_coefficients, _ = get_coefficients(dataloader_ice, fe_model, device)
-# pave_coefficients, _ = get_coefficients(dataloader_pave, fe_model, device)
+maml_path = f'{home}/terrain-adaptation-rls/logs/warthog_sim/maml/seed=0/maml_model.pth'
+maml_model = load_model_maml(device = device, path = maml_path, n_basis=n_basis, hidden_size=hidden_size)
+gs = GlobalState(maml_model, device)
 
 
 if __name__ == "__main__":
@@ -388,14 +340,14 @@ if __name__ == "__main__":
     rospy.init_node('rollouts_server')
 
     # Get robot name from a private parameter (default: "warty")
-    name = rospy.get_param("~name", "jackal_0770")
+    name = rospy.get_param("~name", "warty")
 
     # Start the rollouts service.
     service = rospy.Service(f'{name}/calc_rollouts', MppiRollouts, handle_calc_rollouts)
     rospy.loginfo("Service 'calc_rollouts' ready to calculate MPPI rollouts.")
 
     # Initialize a ROS subscriber.
-    rospy.Subscriber(f'{name}/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, rls_update)
+    rospy.Subscriber(f'{name}/odom_cmd_vel_processed_full2D', OdomCmdVelProcessedFull2D, maml_update)
 
     try:
         rospy.spin()
@@ -405,20 +357,24 @@ if __name__ == "__main__":
 
         # Define CSV filename
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        csv_path = f"{home}/dummy_ws/src/mppi_rollouts/_data/jackal_0770_rls_errors_{timestamp}.csv"
+        csv_path = f"{home}/dummy_ws/src/mppi_rollouts/_data"
+
+        # Create the directory path if it doesn't exist
+        os.makedirs(csv_path, exist_ok=True)
+
+        # Build full filename
+        file_path = os.path.join(csv_path, f"maml_errors_{timestamp}.csv")
 
         # Pad shorter lists with NaNs to align lengths
-        max_len = max(len(gs.time_array), len(gs.rls_err))
+        max_len = max(len(gs.time_array), len(gs.maml_err),)
         def pad(lst): return lst + [float('nan')] * (max_len - len(lst))
 
         rows = zip(
             pad(gs.time_array),
-            pad(gs.rls_err),
-            # pad(gs.node_err),
-            # pad(gs.fe_err),
+            pad(gs.maml_err),
         )
 
-        with open(csv_path, mode='w', newline='') as f:
+        with open(file_path, mode='w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["time_array", "rls_err"])
+            writer.writerow(["time_array", "maml_err"])
             writer.writerows(rows)
